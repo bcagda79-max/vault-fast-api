@@ -1,4 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
+import aiofiles
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -10,10 +12,14 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 import uuid
+import re
 
 load_dotenv()
 
 app = FastAPI()
+
+os.makedirs("uploads", exist_ok=True)
+app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
 # CORS
 app.add_middleware(
@@ -46,6 +52,15 @@ class CategoryCreate(BaseModel):
     color_hex: str
     icon_name: str
     parent_id: Optional[str] = None
+
+class DocumentCreate(BaseModel):
+    category: str
+    sub_category: Optional[str] = None
+    year: int
+    storage_path: str
+    file_name: str
+    page_count: int
+    file_size_bytes: int
 
 async def get_db():
     conn = await asyncpg.connect(
@@ -169,15 +184,17 @@ async def get_categories(conn: asyncpg.Connection = Depends(get_db)):
 @app.post("/categories")
 async def create_category(cat: CategoryCreate, conn: asyncpg.Connection = Depends(get_db)):
     cat_id = str(uuid.uuid4())
+    slug = re.sub(r'[^a-z0-9]+', '-', cat.name.lower()).strip('-')
     try:
         await conn.execute(
-            """INSERT INTO categories (id, name, storage_path, color_hex, icon_name, parent_id)
-               VALUES ($1, $2, $3, $4, $5, $6)""",
-            cat_id, cat.name, cat.storage_path, cat.color_hex, cat.icon_name, cat.parent_id
+            """INSERT INTO categories (id, name, slug, storage_path, color_hex, icon_name, parent_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+            cat_id, cat.name, slug, cat.storage_path, cat.color_hex, cat.icon_name, cat.parent_id
         )
         return {
             "id": cat_id, 
             "name": cat.name, 
+            "slug": slug,
             "storage_path": cat.storage_path, 
             "color_hex": cat.color_hex, 
             "icon_name": cat.icon_name, 
@@ -191,6 +208,37 @@ async def create_category(cat: CategoryCreate, conn: asyncpg.Connection = Depend
 async def get_documents(conn: asyncpg.Connection = Depends(get_db)):
     rows = await conn.fetch("SELECT * FROM documents ORDER BY uploaded_at DESC")
     return [dict(row) for row in rows]
+
+@app.post("/upload")
+async def upload_file(storage_path: str = Form(...), file: UploadFile = File(...)):
+    full_path = os.path.join("uploads", storage_path)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    try:
+        async with aiofiles.open(full_path, 'wb') as out_file:
+            content = await file.read()
+            await out_file.write(content)
+        return {"status": "success", "storage_path": storage_path}
+    except Exception as e:
+        print("Upload error:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/documents")
+async def create_document(doc: DocumentCreate, conn: asyncpg.Connection = Depends(get_db)):
+    doc_id = str(uuid.uuid4())
+    try:
+        # Check if sub_category is empty string and set to None if so
+        sub_cat = doc.sub_category if doc.sub_category else None
+        
+        await conn.execute(
+            """INSERT INTO documents (id, category, sub_category, year, storage_path, processing_status, file_name, page_count, file_size_bytes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)""",
+            doc_id, doc.category, sub_cat, doc.year, doc.storage_path, "completed", doc.file_name, doc.page_count, doc.file_size_bytes
+        )
+        row = await conn.fetchrow("SELECT * FROM documents WHERE id = $1", doc_id)
+        return dict(row)
+    except Exception as e:
+        print("Error inserting document:", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
